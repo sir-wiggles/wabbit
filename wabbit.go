@@ -2,102 +2,79 @@ package wabbit
 
 import (
 	"log"
-	"sync"
 	"time"
 
 	"github.com/streadway/amqp"
 )
 
+type session struct {
+	*amqp.Connection
+	*amqp.Channel
+}
+
 type Wabbit struct {
-	*sync.Mutex
-	cond *sync.Cond
+	url string
 
-	url        string
-	dialer     Dialer
-	connection Connection
-	channel    Channel
-	connected  bool
-
+	connection   *amqp.Connection
+	sessions     chan *session
 	shutdown     chan bool
 	disconnected chan *amqp.Error
+	queues       map[string]*QueueParameters
 }
 
 func NewWabbit(url string) *Wabbit {
 	w := &Wabbit{
-		Mutex:    &sync.Mutex{},
-		cond:     &sync.Cond{L: &sync.Mutex{}},
-		dialer:   &AmqpDial{},
+		sessions: make(chan *session),
 		shutdown: make(chan bool),
 		url:      url,
+		queues:   make(map[string]*QueueParameters),
 	}
 
-	w.init()
-	time.Sleep(time.Second)
+	w.connect()
 	return w
 }
 
-func (w *Wabbit) init() {
-	var wg = &sync.WaitGroup{}
-	wg.Add(1)
+func (w Wabbit) Shutdown() {
+	w.shutdown <- true
+}
 
+func (w *Wabbit) connect() {
 	go func() {
-		var ticker = time.NewTicker(time.Millisecond)
+		defer func() {
+			w.connection.Close()
+		}()
+	Connection:
 		for {
-			select {
-
-			case <-ticker.C:
-				ticker.Stop()
-				w.Lock()
-				w.connectionLoop()
-				w.connected = true
-				w.Unlock()
-				wg.Done()
-
-			case <-w.disconnected:
-				w.Lock()
-				w.connectionLoop()
-				w.connected = true
-				w.Unlock()
-
-			case <-w.shutdown:
-				return
+			connection, err := amqp.Dial(w.url)
+			if err != nil {
+				log.Println(err.(*amqp.Error).Reason)
+				time.Sleep(time.Second * 2)
+				continue
 			}
-			w.cond.Broadcast()
+			w.connection = connection
+			w.disconnected = connection.NotifyClose(make(chan *amqp.Error))
+
+		Channel:
+			for {
+				channel, err := connection.Channel()
+				if err != nil {
+					log.Println(err.(*amqp.Error).Reason)
+					break Connection
+				}
+
+				select {
+				case w.sessions <- &session{connection, channel}:
+				case <-w.disconnected:
+					break Channel
+				case <-w.shutdown:
+					return
+				}
+			}
 		}
 	}()
-
-	wg.Wait()
 }
 
-func (w *Wabbit) connectionLoop() {
-	for {
-		if err := w.connect(); err == nil {
-			return
-		}
-		time.Sleep(time.Second)
-	}
-}
-
-func (w *Wabbit) connect() error {
-
-	connection, err := w.dialer.Dial(w.url)
-	if err != nil {
-		return err
-	}
-
-	channel, err := connection.Channel()
-	if err != nil {
-		return err
-	}
-
-	w.connection = connection
-	w.channel = channel
-	w.disconnected = connection.NotifyClose(make(chan *amqp.Error))
-
-	return nil
-}
-
-type QueueArgs struct {
+type QueueParameters struct {
 	Name       string
 	Durable    bool
 	AutoDelete bool
@@ -106,74 +83,88 @@ type QueueArgs struct {
 	Arguments  amqp.Table
 }
 
-func (w *Wabbit) QueueDeclare(args QueueArgs) error {
-	_, err := w.channel.QueueDeclare(
-		args.Name,
-		args.Durable,
-		args.AutoDelete,
-		args.Exclusive,
-		args.NoWait,
-		args.Arguments,
+func (w *Wabbit) QueueDeclare(params *QueueParameters) error {
+	s := <-w.sessions
+	_, err := s.QueueDeclare(
+		params.Name,
+		params.Durable,
+		params.AutoDelete,
+		params.Exclusive,
+		params.NoWait,
+		params.Arguments,
 	)
-	return err
-}
-
-func (w *Wabbit) Publish(exchange, key string, mandatory, immediate bool, msg amqp.Publishing) error {
-	for {
-		w.Lock()
-		if !w.connected {
-			w.Unlock()
-
-			w.cond.L.Lock()
-			w.cond.Wait()
-			w.cond.L.Unlock()
-
-		} else {
-			w.Unlock()
-		}
-		msg.Body = []byte(time.Now().String())
-		if err := w.channel.Publish(exchange, key, mandatory, immediate, msg); err != nil {
-			log.Println("Publishing error: ", err)
-		}
-
-		time.Sleep(time.Millisecond * 3000)
+	if err != nil {
+		return err
 	}
+
+	w.queues[params.Name] = params
+	return nil
 }
 
-func (w *Wabbit) Consume(queue string, messages chan amqp.Delivery) error {
+type PublisherParameters struct {
+	Exchange  string
+	Queue     string
+	Mandatory bool
+	Immediate bool
+}
 
-	consumer := ""
-	autoAck := true
-	exclusive := false
-	noLocal := false
-	noWait := false
-	var args amqp.Table
+func (w *Wabbit) Publish(params *PublisherParameters) chan amqp.Publishing {
+	var input = make(chan amqp.Publishing)
 
-	var deliveries <-chan amqp.Delivery
-	var err error
-
-	for {
-		w.Lock()
-		if !w.connected {
-			w.Unlock()
-
-			w.cond.L.Lock()
-			w.cond.Broadcast()
-			w.cond.L.Unlock()
-		} else {
-			deliveries, err = w.channel.Consume(
-				queue, consumer, autoAck, exclusive, noLocal, noWait, args,
-			)
-			if err != nil {
-				return err
+	go func() {
+		for session := range w.sessions {
+			for msg := range input {
+				if err := session.Publish(
+					params.Exchange,
+					params.Queue,
+					params.Mandatory,
+					params.Immediate,
+					msg,
+				); err != nil {
+					log.Println("Publishing error:", err)
+					break
+				}
 			}
-			w.Unlock()
 		}
+	}()
+	return input
+}
 
-		for m := range deliveries {
-			messages <- m
+type ConsumerParameters struct {
+	Queue     string //:= "foobar"
+	Consumer  string //:= ""
+	AutoAck   bool   //:= true
+	Exclusive bool   //:= false
+	NoLocal   bool   //:= false
+	NoWait    bool   //:= false
+	Args      amqp.Table
+}
+
+func (w *Wabbit) Consume(params *ConsumerParameters) chan amqp.Delivery {
+	var output = make(chan amqp.Delivery)
+
+	go func() {
+		for session := range w.sessions {
+			deliveries, err := session.Consume(
+				params.Queue,
+				params.Consumer,
+				params.AutoAck,
+				params.Exclusive,
+				params.NoLocal,
+				params.NoWait,
+				params.Args,
+			)
+
+			if err != nil {
+				log.Println("Consume Error:", err)
+				continue
+			}
+
+			for d := range deliveries {
+				output <- d
+			}
 		}
+	}()
 
-	}
-
+	return output
 }
